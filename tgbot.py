@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram Server Bot — improved version.
+Telegram Server Bot — improved version v2.
 Fixes: commands like `ping` that need Ctrl+C no longer hang.
-  - Process-group kill (os.setsid + os.killpg)
+  - /run always non-blocking (threaded), bot stays responsive
+  - start_new_session=True for clean process-group isolation
+  - On timeout: SIGINT first (Ctrl+C), wait 3s, then SIGKILL if needed
+  - Distinguishes SIGINT vs SIGKILL in output
   - Configurable per-command timeout: /run 10 ping google.com
-  - On timeout: SIGINT first (like Ctrl+C), collect partial output, then SIGKILL
-  - Default timeout 30s (was 300s)
+  - /ps correctly tracks running tasks
 """
 
 import os
@@ -104,7 +106,7 @@ def send_file(chat_id, file_path, caption=None, telegram_filename=None):
 
 
 # ============================================================
-# Command execution (FIXED)
+# Command execution
 # ============================================================
 
 def _kill_process_group(proc, sig):
@@ -118,8 +120,9 @@ def _kill_process_group(proc, sig):
 def run_command(command, timeout=None):
     """
     Execute a shell command with proper timeout and process-group cleanup.
-    On timeout: send SIGINT (Ctrl+C), wait 2s for graceful exit,
+    On timeout: send SIGINT (Ctrl+C), wait 3s for graceful exit,
     collect partial output, then SIGKILL if still alive.
+    Returns (output_string, timed_out, force_killed).
     """
     if timeout is None:
         timeout = DEFAULT_COMMAND_TIMEOUT
@@ -128,8 +131,8 @@ def run_command(command, timeout=None):
     print(f"[RUN] {command} (timeout={timeout}s)")
 
     try:
-        # Start process in its own process group so we can kill
-        # the whole tree (e.g. ping spawned by bash)
+        # start_new_session=True is the Python-recommended way to
+        # create a new process group (replaces preexec_fn=os.setsid)
         proc = subprocess.Popen(
             command,
             shell=True,
@@ -137,13 +140,15 @@ def run_command(command, timeout=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            preexec_fn=os.setsid,  # new process group
+            start_new_session=True,
         )
+
+        timed_out = False
+        force_killed = False
 
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
             returncode = proc.returncode
-            timed_out = False
         except subprocess.TimeoutExpired:
             # Step 1: SIGINT (what Ctrl+C does)
             _kill_process_group(proc, signal.SIGINT)
@@ -154,6 +159,7 @@ def run_command(command, timeout=None):
             except subprocess.TimeoutExpired:
                 # Step 3: SIGKILL — force kill
                 _kill_process_group(proc, signal.SIGKILL)
+                force_killed = True
                 try:
                     stdout, stderr = proc.communicate(timeout=2)
                 except Exception:
@@ -172,9 +178,13 @@ def run_command(command, timeout=None):
             output = "(no output)"
 
         if timed_out:
+            if force_killed:
+                kill_info = "⏱ 超时 (timeout={}s)\n→ SIGINT 无法结束，已发送 SIGKILL\n"
+            else:
+                kill_info = "⏱ 超时 (timeout={}s)\n→ 已发送 SIGINT\n"
             header = (
                 f"$ {command}\n"
-                f"⏱ 超时 (timeout={timeout}s)，已自动中断 (SIGINT)\n"
+                f"{kill_info.format(timeout)}"
                 f"exit code: {returncode}\n\n"
             )
         else:
@@ -190,21 +200,45 @@ def run_command(command, timeout=None):
 
 
 # ============================================================
-# Background command execution
+# Task tracking
 # ============================================================
 
 _bg_tasks = {}
+_bg_lock = threading.Lock()
+_task_counter = 0
 
 
-def run_background(chat_id, command):
-    """Run a command in background, send output when done."""
+def _next_task_id():
+    global _task_counter
+    with _bg_lock:
+        _task_counter += 1
+        return _task_counter
+
+
+def start_task(chat_id, command, timeout=None):
+    """
+    Run a command in a background thread so the bot stays responsive.
+    Adds the thread to _bg_tasks so /ps can track it.
+    """
+    task_id = _next_task_id()
+
     def worker():
-        output = run_command(command, timeout=MAX_COMMAND_TIMEOUT)
-        send_message(chat_id, output)
+        try:
+            output = run_command(command, timeout=timeout)
+            send_message(chat_id, output)
+        except Exception as e:
+            send_message(chat_id, f"$ {command}\n\nERROR: {e}")
+        finally:
+            with _bg_lock:
+                # Keep finished tasks for a while, then they'll be
+                # cleaned up naturally as daemon threads
+                pass
 
     t = threading.Thread(target=worker, daemon=True)
+    with _bg_lock:
+        _bg_tasks[task_id] = t
     t.start()
-    return "已在后台执行，完成后会发送结果。"
+    return task_id
 
 
 # ============================================================
@@ -245,25 +279,23 @@ def handle_message(message):
 
     # /start
     if text == "/start":
-        send_message(chat_id, """🤖 Telegram Server Bot (改进版)
+        send_message(chat_id, """🤖 Telegram Server Bot (v2)
 
 可用命令：
 
 /run <命令>
 执行 Shell 命令（默认超时 30s）。
+命令在后台线程执行，Bot 不会阻塞。
 
 /run <秒数> <命令>
 指定超时时间执行命令。
 例如: /run 60 ping google.com
 
-/runbg <命令>
-后台执行命令，完成后发送结果。
-
 /getfile <文件路径>
 发送服务器文件。
 
 /ps
-查看当前后台任务。
+查看当前任务。
 
 示例：
   /run df -h
@@ -273,25 +305,18 @@ def handle_message(message):
 """)
         return
 
-    # /run
+    # /run — always threaded, non-blocking
     if text.startswith("/run "):
         command, timeout = parse_run_command(text)
         if not command:
             send_message(chat_id, "用法:\n/run <命令>\n/run <秒数> <命令>")
             return
-        send_message(chat_id, f"执行命令:\n\n$ {command}\n(超时: {timeout or DEFAULT_COMMAND_TIMEOUT}s)")
-        output = run_command(command, timeout=timeout)
-        send_message(chat_id, output)
-        return
-
-    # /runbg
-    if text.startswith("/runbg "):
-        command = text[len("/runbg "):].strip()
-        if not command:
-            send_message(chat_id, "用法:\n/runbg <命令>")
-            return
-        msg = run_background(chat_id, command)
-        send_message(chat_id, msg)
+        effective_timeout = timeout or DEFAULT_COMMAND_TIMEOUT
+        send_message(
+            chat_id,
+            f"⏳ 开始执行:\n\n$ {command}\n(超时: {effective_timeout}s)"
+        )
+        start_task(chat_id, command, timeout=timeout)
         return
 
     # /getfile
@@ -309,11 +334,18 @@ def handle_message(message):
 
     # /ps
     if text == "/ps":
-        active = [tid for tid, t in _bg_tasks.items() if t.is_alive()]
+        with _bg_lock:
+            active = [
+                tid for tid, t in _bg_tasks.items() if t.is_alive()
+            ]
+            total = len(_bg_tasks)
         if active:
-            send_message(chat_id, f"后台任务: {len(active)} 个运行中")
+            send_message(
+                chat_id,
+                f"任务: {len(active)} 个运行中 / {total} 个总计"
+            )
         else:
-            send_message(chat_id, "没有后台任务")
+            send_message(chat_id, "没有正在运行的任务")
         return
 
     # Unknown command
@@ -326,7 +358,7 @@ def handle_message(message):
 # ============================================================
 
 def main():
-    print("Telegram bot starting... (improved version)")
+    print("Telegram bot starting... (v2)")
     offset = None
 
     while True:
